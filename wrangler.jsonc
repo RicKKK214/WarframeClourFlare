@@ -1,0 +1,56 @@
+{
+  // Cloudflare Workers configuration (used by @opennextjs/cloudflare + wrangler).
+  //
+  // Deploy:   npm run cf:deploy
+  // Preview:  npm run cf:preview
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "warframe-prime-arbitrage-scanner",
+  "main": ".open-next/worker.js",
+
+  // nodejs_compat is REQUIRED: Prisma and parts of Next.js use Node built-ins.
+  // The compatibility_date must be 2024-09-23 or later for nodejs_compat v2.
+  "compatibility_date": "2025-05-05",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+
+  // Cloudflare D1 (SQLite). Create it with:
+  //   npx wrangler d1 create wfarb
+  // then paste the returned database_id below.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "wfarb",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+    }
+  ],
+
+  // Workers have no long-lived process, so the background scan loop cannot run.
+  // This cron pulls a scan instead. Every 5 minutes; each run does a small batch
+  // because Cloudflare caps subrequests per invocation (50 free / 1000 paid).
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+
+  "vars": {
+    "WFM_API_BASE": "https://api.warframe.market/v2",
+    "WFM_PLATFORM": "pc",
+    "WFM_CROSSPLAY": "true",
+    "WFM_LANGUAGE": "en",
+    "WFM_RATE_LIMIT_RPS": "3",
+    // Keep well under the 50-subrequest free-plan cap (~5 fetches per set).
+    "CRON_BATCH_LIMIT": "8",
+    "SCANNER_MAX_RESULTS": "300",
+    "SNAPSHOT_RETENTION_DAYS": "14",
+    "CACHE_MAX_AGE_HOURS": "144",
+    // The scanner must not try to start a timer loop on Workers.
+    "DISABLE_BACKGROUND_SCAN": "true"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}

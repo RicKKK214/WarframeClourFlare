@@ -1,0 +1,500 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+/**
+ * Render free-tier resilience tests.
+ * The app runs on an EPHEMERAL filesystem and restarts frequently, so it must
+ * function with an empty, missing or unwritable database.
+ */
+
+vi.mock('@prisma/client', () => ({
+  PrismaClient: class {
+    $queryRaw() { return Promise.reject(new Error('Unable to open the database file')); }
+  },
+}));
+
+const { withDb, dbHealth, probeDb } = await import('../db');
+
+describe('database degradation (ephemeral filesystem)', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('returns the fallback when a read fails', async () => {
+    const r = await withDb(() => Promise.reject(new Error('no such table')), [], 'read');
+    expect(r).toEqual([]);
+  });
+
+  it('returns the fallback when a write fails', async () => {
+    const r = await withDb(() => Promise.reject(new Error('readonly database')), null, 'write');
+    expect(r).toBeNull();
+  });
+
+  it('never throws, so a request can still be served', async () => {
+    await expect(
+      withDb(() => Promise.reject(new Error('disk I/O error')), 'fallback'),
+    ).resolves.toBe('fallback');
+  });
+
+  it('marks health as failed and records the error', async () => {
+    await withDb(() => Promise.reject(new Error('boom')), null, 'ctx');
+    const h = dbHealth();
+    expect(h.ok).toBe(false);
+    expect(h.lastError).toContain('ctx');
+  });
+
+  it('recovers health after a subsequent success', async () => {
+    await withDb(() => Promise.reject(new Error('boom')), null);
+    expect(dbHealth().ok).toBe(false);
+    await withDb(() => Promise.resolve('fine'), null);
+    expect(dbHealth().ok).toBe(true);
+  });
+
+  it('passes through the value on success', async () => {
+    expect(await withDb(() => Promise.resolve(42), 0)).toBe(42);
+  });
+
+  it('probeDb reports unhealthy for an unusable database', async () => {
+    const h = await probeDb();
+    expect(h.ok).toBe(false);
+    expect(h.checkedAt).not.toBeNull();
+  });
+});
+
+describe('PORT / host binding configuration', () => {
+  it('start script binds 0.0.0.0 and honours $PORT', async () => {
+    const fs = await import('node:fs');
+    const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+    expect(pkg.scripts.start).toContain('-H 0.0.0.0');
+    expect(pkg.scripts.start).toContain('${PORT:-3000}');
+  });
+
+  it('render start script execs next start with $PORT on 0.0.0.0', async () => {
+    const fs = await import('node:fs');
+    const sh = fs.readFileSync('scripts/start-render.sh', 'utf8');
+    expect(sh).toMatch(/-H 0\.0\.0\.0/);
+    expect(sh).toMatch(/\$PORT/);
+    expect(sh).toMatch(/PORT:=3000/);
+  });
+
+  it('render start script tolerates a failed schema push', async () => {
+    const fs = await import('node:fs');
+    const sh = fs.readFileSync('scripts/start-render.sh', 'utf8');
+    expect(sh).toMatch(/Continuing without persistence/i);
+  });
+
+  it('render.yaml does not force DATABASE_URL and configures a health check', async () => {
+    const fs = await import('node:fs');
+    const y = fs.readFileSync('render.yaml', 'utf8');
+    // Cached market data must live in an external DB, not on Render's ephemeral disk.
+    expect(y).not.toContain('file:/tmp/dev.db');
+    // Declaring DATABASE_URL with sync:false makes Render block the deploy until a
+    // value is entered; the app does not need one, so it must not be declared.
+    expect(y).not.toMatch(/- key: DATABASE_URL/);
+    expect(y).toContain('healthCheckPath: /api/health');
+    expect(y).toContain('plan: free');
+  });
+});
+
+describe('DATABASE_URL resolution (regression)', () => {
+  // Regression: with no .env and no exported DATABASE_URL, Prisma threw
+  // "Environment variable not found: DATABASE_URL" on EVERY query (122 errors in
+  // a 50s boot), flooding logs and silently disabling all persistence.
+  it('falls back to a usable Postgres URL when DATABASE_URL is unset', async () => {
+    vi.resetModules();
+    const prev = process.env.DATABASE_URL;
+    delete process.env.DATABASE_URL;
+    const env = await import('../env');
+    const usedFallback = env.ensureDatabaseUrl();
+    expect(usedFallback).toBe(true);
+    expect(process.env.DATABASE_URL).toBeTruthy();
+    expect(process.env.DATABASE_URL).toMatch(/^postgresql:\/\//);
+    if (prev === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = prev;
+  });
+
+  it('does not override an explicitly configured DATABASE_URL', async () => {
+    vi.resetModules();
+    const prev = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = 'postgresql://custom:pw@db.example.com:5432/app';
+    const env = await import('../env');
+    expect(env.ensureDatabaseUrl()).toBe(false);
+    expect(process.env.DATABASE_URL).toBe('postgresql://custom:pw@db.example.com:5432/app');
+    if (prev === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = prev;
+  });
+
+  it('uses an unreachable placeholder in production rather than failing', async () => {
+    const env = await import('../env');
+    // The DB is only a cache: a missing URL must never stop the app booting.
+    const url = env.defaultDatabaseUrl('production');
+    expect(url).toMatch(/^postgresql:\/\//);
+    expect(url).toContain('unset');
+  });
+
+  it('uses a local Postgres database outside production', async () => {
+    const env = await import('../env');
+    expect(env.defaultDatabaseUrl('development')).toMatch(/^postgresql:\/\//);
+  });
+
+  it('start script continues without DATABASE_URL instead of exiting', async () => {
+    const fs = await import('node:fs');
+    const sh = fs.readFileSync('scripts/start-render.sh', 'utf8');
+    // Regression: this used to `exit 1`, which broke deploys on hosts with no database.
+    expect(sh).not.toMatch(/FATAL: DATABASE_URL/);
+    expect(sh).not.toMatch(/exit 1/);
+    expect(sh).toMatch(/WITHOUT a persistent cache/);
+    expect(sh).toMatch(/export DATABASE_URL/);
+  });
+
+  it('next.config guarantees DATABASE_URL at build time', async () => {
+    const fs = await import('node:fs');
+    const cfg = fs.readFileSync('next.config.mjs', 'utf8');
+    expect(cfg).toContain('DATABASE_URL');
+  });
+
+  it('predev hook bootstraps .env for fresh clones', async () => {
+    const fs = await import('node:fs');
+    const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+    expect(pkg.scripts.predev).toContain('setup-env');
+  });
+});
+
+describe('cached market data (survives restarts)', () => {
+  it('uses PostgreSQL, not an ephemeral file database', async () => {
+    const fs = await import('node:fs');
+    const schema = fs.readFileSync('prisma/schema.prisma', 'utf8');
+    expect(schema).toMatch(/provider\s*=\s*"postgresql"/);
+    expect(schema).not.toMatch(/provider\s*=\s*"sqlite"/);
+  });
+
+  it('defines a CachedAnalysis model keyed by set slug', async () => {
+    const fs = await import('node:fs');
+    const schema = fs.readFileSync('prisma/schema.prisma', 'utf8');
+    expect(schema).toMatch(/model CachedAnalysis/);
+    expect(schema).toMatch(/setSlug\s+String\s+@id/);
+    expect(schema).toMatch(/fetchedAt\s+DateTime/);
+  });
+
+  it('still starts in production without DATABASE_URL', async () => {
+    const env = await import('../env');
+    // Defaulting to a file on Render's ephemeral disk would discard the cache every restart.
+    // The DB is only a cache: a missing URL must never stop the app booting.
+    const url = env.defaultDatabaseUrl('production');
+    expect(url).toMatch(/^postgresql:\/\//);
+    expect(url).toContain('unset');
+  });
+
+  it('hydrates on boot, before any background scan starts', async () => {
+    const fs = await import('node:fs');
+    const instr = fs.readFileSync('src/instrumentation.ts', 'utf8');
+    const hydrateAt = instr.indexOf('hydrate');
+    const startAt = instr.indexOf('startBackground');
+    expect(hydrateAt).toBeGreaterThan(-1);
+    expect(startAt).toBeGreaterThan(-1);
+    expect(hydrateAt).toBeLessThan(startAt);
+  });
+
+  it('bounds cache age so stale prices are not shown as current', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/services/ScannerService.ts', 'utf8');
+    expect(src).toMatch(/CACHE_MAX_AGE_HOURS/);
+    expect(src).toMatch(/fetchedAt:\s*\{\s*gte:\s*cutoff\s*\}/);
+  });
+
+  it('refreshes the stalest sets first after hydrating', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/services/ScannerService.ts', 'utf8');
+    expect(src).toMatch(/staleness/);
+  });
+});
+
+describe('keep-alive (Render spin-down)', () => {
+  it('exposes a ping endpoint that does no real work', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/app/api/ping/route.ts', 'utf8');
+    expect(src).toMatch(/export async function GET/);
+    // A keep-alive that queries the DB or the market API would create constant load.
+    expect(src).not.toMatch(/prisma|scanner|fetch\(/);
+  });
+
+  it('schedules pings inside the free instance-hour budget', async () => {
+    const fs = await import('node:fs');
+    const wf = fs.readFileSync('.github/workflows/keep-alive.yml', 'utf8');
+    const cron = /cron:\s*'([^']+)'/.exec(wf)?.[1] ?? '';
+    expect(cron).toBeTruthy();
+
+    const [minute, hours] = cron.split(' ');
+    // Must ping more often than Render's 15-minute idle timeout.
+    const everyN = Number(/\*\/(\d+)/.exec(minute)?.[1] ?? '999');
+    expect(everyN).toBeLessThan(15);
+
+    // Must NOT run 24/7: 750 free instance hours/month vs ~744 hours in a month.
+    expect(hours).not.toBe('*');
+    const m = /(\d+)-(\d+)/.exec(hours);
+    expect(m).toBeTruthy();
+    const hoursPerDay = Number(m![2]) - Number(m![1]) + 1;
+    expect(hoursPerDay * 31).toBeLessThan(750);
+  });
+
+  it('warns against pinging robots.txt, which Render answers while asleep', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/app/api/ping/route.ts', 'utf8');
+    expect(src).toMatch(/robots\.txt/);
+  });
+});
+
+describe('instant-profit filter', () => {
+  it('accepts minInstantProfit and minInstantRoi as query params', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/app/api/opportunities/route.ts', 'utf8');
+    expect(src).toMatch(/num\('minInstantProfit'\)/);
+    expect(src).toMatch(/num\('minInstantRoi'\)/);
+  });
+
+  it('filters on instantProfit, not the mode-dependent profit field', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/app/api/opportunities/route.ts', 'utf8');
+    // Must read r.instantProfit so the filter works while viewing Listing mode.
+    expect(src).toMatch(/r\.instantProfit \?\? 0\) >= minInstantProfit/);
+    expect(src).toMatch(/r\.instantRoi \?\? 0\) >= minInstantRoi/);
+  });
+
+  it('offers instant sort options', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/app/api/opportunities/route.ts', 'utf8');
+    expect(src).toMatch(/instantProfit: \(a, b\)/);
+    expect(src).toMatch(/instantRoi: \(a, b\)/);
+  });
+});
+
+describe('sticky filters', () => {
+  it('persists filters to localStorage under a versioned key', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/components/OpportunityTable.tsx', 'utf8');
+    expect(src).toMatch(/FILTERS_STORAGE_KEY\s*=\s*'wfarb\.filters\.v\d+'/);
+    expect(src).toMatch(/useStickyState<Filters>\(FILTERS_STORAGE_KEY, DEFAULTS\)/);
+  });
+
+  it('waits for stored filters before fetching, avoiding a wrong-results flash', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/components/OpportunityTable.tsx', 'utf8');
+    expect(src).toMatch(/if \(!filtersReady\) return;/);
+  });
+
+  it('reads storage in an effect, not during render (hydration safety)', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/useStickyState.ts', 'utf8');
+    const stateInit = src.indexOf('useState<T>(fallback)');
+    const read = src.indexOf('localStorage.getItem');
+    expect(stateInit).toBeGreaterThan(-1);
+    // The initial state must be the fallback; the read happens later, inside useEffect.
+    expect(src.slice(stateInit, read)).toMatch(/useEffect/);
+  });
+
+  it('merges stored values over defaults so new filters are picked up', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/useStickyState.ts', 'utf8');
+    expect(src).toMatch(/\.\.\.fallbackRef\.current/);
+    expect(src).toMatch(/typeof stored === typeof fallbackRef\.current\[k\]/);
+  });
+
+  it('survives storage being unavailable', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/useStickyState.ts', 'utf8');
+    // Both read and write must be guarded; private mode throws on access.
+    expect((src.match(/catch/g) ?? []).length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('reset clears the stored value, not just the in-memory state', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/useStickyState.ts', 'utf8');
+    expect(src).toMatch(/localStorage\.removeItem\(key\)/);
+    const table = fs.readFileSync('src/components/OpportunityTable.tsx', 'utf8');
+    expect(table).toMatch(/onClick=\{resetStoredFilters\}/);
+  });
+});
+
+describe('refresh countdown & part totals', () => {
+  it('tracks the next scheduled scan so the UI can count down', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/services/ScannerService.ts', 'utf8');
+    expect(src).toMatch(/nextRunAt: number \| null/);
+    expect(src).toMatch(/this\.state\.nextRunAt = Date\.now\(\) \+ backoff/);
+  });
+
+  it('clears the countdown while a scan is running', async () => {
+    const fs = await import('node:fs');
+    const route = fs.readFileSync('src/app/api/status/route.ts', 'utf8');
+    // Reporting both "scanning" and a countdown at once makes the header flicker.
+    expect(route).toMatch(/scanner\.state\.running \? null : scanner\.state\.nextRunAt/);
+  });
+
+  it('exposes part totals, counting shared parts once', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/services/ScannerService.ts', 'utf8');
+    expect(src).toMatch(/partTotals\(\)/);
+    expect(src).toMatch(/const unique = new Set<string>\(\)/);
+    expect(src).toMatch(/uniqueParts: unique\.size/);
+  });
+
+  it('renders the countdown as m:ss and ticks every second', async () => {
+    const fs = await import('node:fs');
+    const nav = fs.readFileSync('src/components/Nav.tsx', 'utf8');
+    expect(nav).toMatch(/function mmss/);
+    expect(nav).toMatch(/padStart\(2, '0'\)/);
+    // A 1s local tick is needed because status polling is only every 5s.
+    expect(nav).toMatch(/setInterval\(\(\) => setNow\(Date\.now\(\)\), 1000\)/);
+  });
+});
+
+describe('per-device settings (no cross-user leakage)', () => {
+  it('settings cannot be changed over HTTP', async () => {
+    const fs = await import('node:fs');
+    const route = fs.readFileSync('src/app/api/settings/route.ts', 'utf8');
+    // Regression: any anonymous visitor could POST here and change the platform,
+    // pricing mode and scan interval for EVERY user, plus wipe the shared cache.
+    expect(route).toMatch(/status: 405/);
+    expect(route).not.toMatch(/saveSettings/);
+    expect(route).not.toMatch(/cache\.clearPrefix/);
+  });
+
+  it('preferences are stored per device, not on the server', async () => {
+    const fs = await import('node:fs');
+    const page = fs.readFileSync('src/app/settings/page.tsx', 'utf8');
+    expect(page).toMatch(/useStickyState<Prefs>/);
+    expect(page).toMatch(/Saved on this device only/);
+    expect(page).not.toMatch(/method: 'POST'/);
+  });
+
+  it('the shared refresh interval is not user-editable', async () => {
+    const fs = await import('node:fs');
+    const page = fs.readFileSync('src/app/settings/page.tsx', 'utf8');
+    expect(page).toMatch(/REFRESH_INTERVAL_SECONDS/);
+    expect(page).not.toMatch(/setDraft\(\{ \.\.\.draft, refreshSeconds/);
+  });
+
+  it('per-visitor overrides never write the shared cache', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/services/ScannerService.ts', 'utf8');
+    expect(src).toMatch(/if \(!overrides\) \{[\s\S]*?this\.results\.set/);
+  });
+
+  it('rejects invalid preference values from the query string', async () => {
+    const { prefsFromRequest, DEFAULT_PREFS } = await import('../prefs');
+    const url = new URL('http://x/api?platform=hacked&mode_pricing=bogus&language=!!');
+    const p = prefsFromRequest(url, DEFAULT_PREFS);
+    expect(p.platform).toBe(DEFAULT_PREFS.platform);
+    expect(p.pricingMode).toBe(DEFAULT_PREFS.pricingMode);
+    expect(p.language).toBe(DEFAULT_PREFS.language);
+  });
+
+  it('two visitors can request different pricing on the same endpoint', async () => {
+    const { prefsFromRequest, DEFAULT_PREFS } = await import('../prefs');
+    const a = prefsFromRequest(new URL('http://x/api?mode_pricing=lowest'), DEFAULT_PREFS);
+    const b = prefsFromRequest(new URL('http://x/api?mode_pricing=weighted'), DEFAULT_PREFS);
+    expect(a.pricingMode).not.toBe(b.pricingMode);
+  });
+});
+
+describe('non-Prime sets are scannable', () => {
+  it('treats any tagged set as a set, not just Prime', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/services/ItemCatalogService.ts', 'utf8');
+    // Regression: requiring the 'prime' tag hid 70 tradable sets, including
+    // Carmine Penta, the Vandals/Wraiths, Shedu and the Archwing sets.
+    expect(src).toMatch(/isSet: tags\.includes\('set'\)/);
+    expect(src).toMatch(/primeOnly \? e\.isPrimeSet : e\.isSet/);
+  });
+
+  it('keeps a way back to Prime-only via env', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/services/ItemCatalogService.ts', 'utf8');
+    expect(src).toMatch(/SCANNER_PRIME_ONLY/);
+  });
+
+  it('the set detail route no longer rejects non-Prime sets', async () => {
+    const fs = await import('node:fs');
+    const route = fs.readFileSync('src/app/api/sets/[slug]/route.ts', 'utf8');
+    expect(route).toMatch(/if \(!known\.isSet\)/);
+    expect(route).not.toMatch(/is not a tradable Prime set/);
+  });
+});
+
+describe('storage stays inside a free-tier database', () => {
+  it('prunes price history so the DB cannot grow without bound', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/services/ScannerService.ts', 'utf8');
+    // MarketSnapshot is append-only: ~14k rows/day at a 2-minute interval would fill
+    // a 500 MB free-tier database in about two months and then fail writes.
+    expect(src).toMatch(/marketSnapshot\.deleteMany/);
+    expect(src).toMatch(/SNAPSHOT_RETENTION_DAYS/);
+  });
+
+  it('rate-limits pruning so it does not run on every scan', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/services/ScannerService.ts', 'utf8');
+    expect(src).toMatch(/lastPruneAt/);
+    expect(src).toMatch(/60 \* 60 \* 1000/);
+  });
+
+  it('pruning failure never breaks a scan', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/services/ScannerService.ts', 'utf8');
+    expect(src).toMatch(/pruneHistory\(\)\.catch/);
+  });
+});
+
+describe('Cloudflare Workers deployment', () => {
+  it('keeps a D1 schema variant with payload as TEXT, not Json', async () => {
+    const fs = await import('node:fs');
+    const d1 = fs.readFileSync('prisma/schema.d1.prisma', 'utf8');
+    // SQLite/D1 has no Json column type - Prisma refuses to validate `Json` there.
+    expect(d1).toMatch(/provider = "sqlite"/);
+    expect(d1).toMatch(/payload\s+String/);
+    expect(d1).not.toMatch(/payload\s+Json/);
+  });
+
+  it('keeps Postgres as the default schema for Render', async () => {
+    const fs = await import('node:fs');
+    const pg = fs.readFileSync('prisma/schema.prisma', 'utf8');
+    expect(pg).toMatch(/provider = "postgresql"/);
+  });
+
+  it('serialises the payload so one encoding works on both databases', async () => {
+    const fs = await import('node:fs');
+    const src = fs.readFileSync('src/lib/services/ScannerService.ts', 'utf8');
+    expect(src).toMatch(/function encodePayload/);
+    expect(src).toMatch(/function decodePayload/);
+    // decode must tolerate both a TEXT string (D1) and an already-parsed object (jsonb).
+    expect(src).toMatch(/typeof raw === 'string'/);
+  });
+
+  it('exposes a pull-based scan endpoint for hosts without background timers', async () => {
+    const fs = await import('node:fs');
+    const route = fs.readFileSync('src/app/api/cron/scan/route.ts', 'utf8');
+    // Workers destroy the isolate after the response, so setTimeout loops never fire.
+    expect(route).toMatch(/CRON_BATCH_LIMIT/);
+    expect(route).toMatch(/CRON_SECRET/);
+    expect(route).toMatch(/status: 401/);
+  });
+
+  it('keeps the cron batch inside the Cloudflare free subrequest cap', async () => {
+    const fs = await import('node:fs');
+    const wrangler = fs.readFileSync('wrangler.jsonc', 'utf8');
+    const batch = Number(/"CRON_BATCH_LIMIT":\s*"(\d+)"/.exec(wrangler)?.[1] ?? '999');
+    // ~5 fetches per set (set + parts); Cloudflare Free allows 50 subrequests per invocation.
+    expect(batch * 5).toBeLessThan(50);
+  });
+
+  it('disables the background timer loop on Workers', async () => {
+    const fs = await import('node:fs');
+    const wrangler = fs.readFileSync('wrangler.jsonc', 'utf8');
+    expect(wrangler).toMatch(/"DISABLE_BACKGROUND_SCAN":\s*"true"/);
+    expect(wrangler).toMatch(/"crons"/);
+  });
+
+  it('requires nodejs_compat for Prisma', async () => {
+    const fs = await import('node:fs');
+    const wrangler = fs.readFileSync('wrangler.jsonc', 'utf8');
+    expect(wrangler).toMatch(/nodejs_compat/);
+    expect(wrangler).toMatch(/"binding":\s*"DB"/);
+  });
+});

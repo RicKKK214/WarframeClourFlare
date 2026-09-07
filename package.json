@@ -14,10 +14,9 @@
     "predev": "node scripts/setup-env.mjs",
     "setup": "node scripts/setup-env.mjs",
     "cf:d1:sql": "node scripts/cf-init-d1.mjs",
-    "cf:generate": "prisma generate --schema prisma/schema.d1.prisma",
-    "cf:build": "npm run cf:generate && opennextjs-cloudflare build",
-    "cf:preview": "npm run cf:build && opennextjs-cloudflare preview",
-    "cf:deploy": "npm run cf:build && opennextjs-cloudflare deploy",
+    "cf:build": "opennextjs-cloudflare build",
+    "cf:preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
+    "cf:deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
     "prisma:pg": "prisma generate --schema prisma/schema.prisma"
   },
   "dependencies": {

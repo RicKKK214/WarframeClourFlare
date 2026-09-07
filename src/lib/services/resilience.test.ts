@@ -498,3 +498,23 @@ describe('Cloudflare Workers deployment', () => {
     expect(wrangler).toMatch(/"binding":\s*"DB"/);
   });
 });
+
+describe('Cloudflare deploy pipeline', () => {
+  it('overrides buildCommand so OpenNext does not regenerate the Postgres client', async () => {
+    const fs = await import('node:fs');
+    const cfg = fs.readFileSync('open-next.config.ts', 'utf8');
+    // OpenNext runs `npm run build` by default, which is the RENDER build. That would
+    // overwrite the D1 client and ship a Worker that cannot reach its own database.
+    expect(cfg).toMatch(/buildCommand/);
+    expect(cfg).toMatch(/schema\.d1\.prisma/);
+  });
+
+  it('cf:deploy builds before deploying', async () => {
+    const fs = await import('node:fs');
+    const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+    // Regression: `npx wrangler deploy` alone failed with
+    // "Could not find compiled Open Next config, did you run the build command?"
+    expect(pkg.scripts['cf:deploy']).toMatch(/opennextjs-cloudflare build/);
+    expect(pkg.scripts['cf:deploy']).toMatch(/opennextjs-cloudflare deploy/);
+  });
+});

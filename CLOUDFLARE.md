@@ -73,6 +73,28 @@ the request carries `Authorization: Bearer <secret>` or `?key=<secret>`.
 npm run cf:deploy
 ```
 
+### Deploying from Cloudflare Pages/Workers CI
+
+If you connect the repo to Cloudflare's git integration, set the commands explicitly:
+
+| Setting | Value |
+|---|---|
+| Build command | `npm run cf:build` |
+| Deploy command | `npx wrangler deploy` |
+
+**Do not leave the build command as `npm run build`.** That is the *Render* build: it runs
+`prisma generate` against `prisma/schema.prisma` (PostgreSQL) and produces `.next`, not
+`.open-next`. The deploy step then fails with:
+
+```
+ERROR Could not find compiled Open Next config, did you run the build command?
+```
+
+`open-next.config.ts` sets `buildCommand` so that OpenNext generates the **D1** client
+during `cf:build`. Without that override OpenNext calls `npm run build` internally, which
+regenerates the PostgreSQL client on top of the D1 one — the deploy succeeds and the Worker
+then fails at runtime because Prisma is configured for a database it cannot reach.
+
 Verified bundle size: **959 KiB gzipped**, against a 3 MiB limit on the Free plan.
 
 ---

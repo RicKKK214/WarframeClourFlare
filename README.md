@@ -58,6 +58,8 @@ npm run db:setup
 | `npm start` | Run the production build on `0.0.0.0:${PORT:-3000}` |
 | `npm run start:render` | Production start used on Render (boot-time schema push + `$PORT`) |
 | `npm test` | Run the arbitrage/pricing unit tests (Vitest) |
+| `npm run typecheck` | Type-check the app **and** the Cloudflare worker entrypoint |
+| `npm run lint` | ESLint (`next/core-web-vitals`) |
 | `npm run db:push` | Sync the Prisma schema to SQLite |
 
 ---

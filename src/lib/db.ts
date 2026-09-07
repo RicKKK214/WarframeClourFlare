@@ -43,17 +43,47 @@ function makeD1Client(): PrismaClient | null {
 
 const g = globalThis as unknown as { __prisma?: PrismaClient; __dbBroken?: boolean };
 
-export const prisma =
-  g.__prisma ??
-  makeD1Client() ??
-  new PrismaClient({
-    // Prisma's own error logging is disabled: a misconfigured/absent database would
-    // otherwise emit one multi-line error per query. We surface a single throttled
-    // warning from withDb() instead (see below).
-    log: [],
-  });
+/**
+ * Construct the client LAZILY, on first query.
+ *
+ * `new PrismaClient()` throws synchronously when the generated client is missing
+ * ("@prisma/client did not initialize yet"). At module scope that turns an optional
+ * cache into a fatal error: `next build` crashed with "Failed to collect page data for
+ * /api/cron/scan" simply because `prisma generate` had not run — even though every call
+ * site is already wrapped in withDb() and the app is designed to work with no database
+ * at all. Deferring construction means that failure surfaces as one throttled warning
+ * from withDb() and the app keeps serving live market data.
+ */
+let client: PrismaClient | null = null;
 
-if (process.env.NODE_ENV !== 'production') g.__prisma = prisma;
+function getClient(): PrismaClient {
+  if (g.__prisma) return g.__prisma;
+  if (!client) {
+    client =
+      makeD1Client() ??
+      new PrismaClient({
+        // Prisma's own error logging is disabled: a misconfigured/absent database would
+        // otherwise emit one multi-line error per query. We surface a single throttled
+        // warning from withDb() instead (see below).
+        log: [],
+      });
+    if (process.env.NODE_ENV !== 'production') g.__prisma = client;
+  }
+  return client;
+}
+
+/**
+ * A proxy so existing call sites keep using `prisma.model.op(...)` unchanged while the
+ * real client is only built when a property is actually read.
+ */
+export const prisma = new Proxy({} as PrismaClient, {
+  get(_t, prop, receiver) {
+    return Reflect.get(getClient() as object, prop, receiver);
+  },
+  has(_t, prop) {
+    return Reflect.has(getClient() as object, prop);
+  },
+}) as PrismaClient;
 
 export interface DbHealth {
   ok: boolean;

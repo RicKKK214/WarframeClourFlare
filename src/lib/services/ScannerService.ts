@@ -209,7 +209,10 @@ export class ScannerService {
         },
       }), null, 'opportunity');
     }
-    const w = await withDb(
+    // The fallback is `null`, so the generic must be stated explicitly: otherwise TypeScript
+    // infers T from the fallback alone (`null`) whenever the Prisma client's types are not
+    // available - e.g. before `prisma generate` has run - and `w.lastProfit` fails to compile.
+    const w = await withDb<{ lastProfit: number | null } | null>(
       () => prisma.watchlist.findUnique({ where: { setSlug: a.slug } }),
       null,
       'watchlistLookup',
@@ -240,7 +243,19 @@ export class ScannerService {
       nextRunAt: null,
     };
     try {
-      const sets: CatalogEntry[] = await itemCatalog.getPrimeSets();
+      // A catalog fetch failure (Warframe.market down, DNS blocked, offline host) used to
+      // propagate out of scan(), which turned every caller into a 5xx even when there were
+      // perfectly good cached results in memory. Treat it like any other failed pass:
+      // record it, back off, and keep serving what we already have.
+      let sets: CatalogEntry[];
+      try {
+        sets = await itemCatalog.getPrimeSets();
+      } catch (e) {
+        this.state.errors++;
+        this.state.consecutiveFailures++;
+        this.state.lastError = `catalog: ${e instanceof Error ? e.message : String(e)}`;
+        return this.state;
+      }
 
       // Refresh never-scanned and stalest sets first, so hydrated-but-old prices get
       // updated before already-fresh ones are re-fetched.

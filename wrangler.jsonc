@@ -5,7 +5,11 @@
   // Preview:  npm run cf:preview
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "warframe-prime-arbitrage-scanner",
-  "main": ".open-next/worker.js",
+  // Custom entrypoint: it re-exports OpenNext's fetch handler and ADDS the `scheduled`
+  // handler the cron trigger below needs. Pointing this at ".open-next/worker.js"
+  // directly means the cron fires into a worker with no scheduled() export and nothing
+  // happens. See worker.ts.
+  "main": "worker.ts",
 
   // nodejs_compat is REQUIRED: Prisma and parts of Next.js use Node built-ins.
   // The compatibility_date must be 2024-09-23 or later for nodejs_compat v2.

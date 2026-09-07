@@ -1,0 +1,44 @@
+# Lint, type-check, test and build on every push and pull request.
+#
+# The build step generates the Prisma client first, which is what catches the class of
+# error that previously only appeared on the deploy host (a type error in a Prisma call
+# site compiles locally when a stale client is present, and fails in CI where it is not).
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # Persistence is optional; an unreachable placeholder keeps Prisma constructible
+      # without CI needing a real database.
+      DATABASE_URL: 'postgresql://ci:ci@127.0.0.1:5432/ci'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Type-check (app + Cloudflare worker)
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Production build
+        run: npx next build

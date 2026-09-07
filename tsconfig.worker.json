@@ -1,0 +1,14 @@
+{
+  // Type-checks worker.ts against the Workers runtime types instead of the DOM/Next.js
+  // types used by the app. worker.ts is excluded from the main tsconfig because
+  // `next build` would otherwise try to compile it (and fail on the build-time-generated
+  // .open-next/worker.js import).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types"],
+    "lib": ["esnext"],
+    "noEmit": true
+  },
+  "include": ["worker.ts"],
+  "exclude": ["node_modules"]
+}

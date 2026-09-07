@@ -20,13 +20,16 @@
   // Cloudflare D1 (SQLite). Create it with:
   //   npx wrangler d1 create wfarb
   // then paste the returned database_id below.
+{
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "wfarb",
       "database_id": "a7299354-6a3b-488b-81e1-d039314b4375"
     }
-  ],
+  ]
+}
+,
 
   // Workers have no long-lived process, so the background scan loop cannot run.
   // This cron pulls a scan instead. Every 5 minutes; each run does a small batch
